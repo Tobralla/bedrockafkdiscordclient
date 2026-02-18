@@ -1,8 +1,11 @@
-const express    = require('express');
+const express      = require('express');
 const { createClient } = require('bedrock-protocol');
+const { Authflow, Titles } = require('prismarine-auth');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const { SocksProxyAgent } = require('socks-proxy-agent');
 const EventEmitter = require('events');
-const path       = require('path');
-
+const path         = require('path');
+const os           = require('os');
 const {
   Client: DiscordClient,
   GatewayIntentBits,
@@ -12,16 +15,35 @@ const {
 
 // ─────────────────────────────────────────────
 //  Config — Railway environment variables
-//  Set these in your Railway service settings:
-//    DISCORD_TOKEN, DISCORD_CLIENT_ID,
-//    DISCORD_GUILD_ID, DISCORD_CHANNEL_ID
 // ─────────────────────────────────────────────
 const DISCORD_TOKEN      = process.env.DISCORD_TOKEN;
 const DISCORD_CLIENT_ID  = process.env.DISCORD_CLIENT_ID;
 const DISCORD_GUILD_ID   = process.env.DISCORD_GUILD_ID;
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+const DISCORD_ENABLED    = !!DISCORD_TOKEN;
 
-const DISCORD_ENABLED = !!DISCORD_TOKEN;
+// ─────────────────────────────────────────────
+//  Proxy pool — credentials from Railway env vars,
+//  endpoints hardcoded (they're just IPs, not secrets)
+//  Set: PROXY_USERNAME  PROXY_PASSWORD
+// ─────────────────────────────────────────────
+const PROXY_USER = process.env.PROXY_USERNAME || '';
+const PROXY_PASS = process.env.PROXY_PASSWORD || '';
+
+const PROXY_ENDPOINTS = [
+  { host: 'dc.oxylabs.io', port: 8002, ip: '93.115.200.158', label: 'Oxylabs US #1' },
+  { host: 'dc.oxylabs.io', port: 8003, ip: '93.115.200.157', label: 'Oxylabs US #2' },
+  { host: 'dc.oxylabs.io', port: 8004, ip: '93.115.200.156', label: 'Oxylabs US #3' },
+  { host: 'dc.oxylabs.io', port: 8005, ip: '93.115.200.155', label: 'Oxylabs US #4' },
+];
+
+// Build full proxy URL list (only when credentials are set)
+const PROXY_LIST = PROXY_USER
+  ? PROXY_ENDPOINTS.map(e => ({
+      ...e,
+      url: `http://${encodeURIComponent(PROXY_USER)}:${encodeURIComponent(PROXY_PASS)}@${e.host}:${e.port}`,
+    }))
+  : [];
 
 // ─────────────────────────────────────────────
 //  Express
@@ -32,7 +54,7 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ─────────────────────────────────────────────
-//  Global SSE emitter
+//  SSE emitter
 // ─────────────────────────────────────────────
 const globalEmitter = new EventEmitter();
 globalEmitter.setMaxListeners(50);
@@ -43,34 +65,90 @@ globalEmitter.setMaxListeners(50);
 const accountData = new Map();
 
 // ─────────────────────────────────────────────
-//  Discord client
+//  Discord
 // ─────────────────────────────────────────────
-let discord = null;
+let discord       = null;
 let discordChannel = null;
 
+// ─────────────────────────────────────────────
+//  Proxy helpers
+// ─────────────────────────────────────────────
+
+/**
+ * Build an http.Agent from a proxy URL.
+ * Supports: http://, https://, socks4://, socks5://
+ * Returns null when proxyUrl is falsy.
+ */
+function buildAgent(proxyUrl) {
+  if (!proxyUrl || !proxyUrl.trim()) return null;
+  const url = proxyUrl.trim();
+  if (url.startsWith('socks')) return new SocksProxyAgent(url);
+  return new HttpsProxyAgent(url);
+}
+
+/**
+ * Return a masked version of the proxy URL safe for logging.
+ * socks5://user:PASS@host:port  =>  socks5://user:***@host:port
+ */
+function maskProxy(proxyUrl) {
+  if (!proxyUrl) return null;
+  try {
+    const u = new URL(proxyUrl);
+    if (u.password) u.password = '***';
+    return u.toString();
+  } catch {
+    return proxyUrl;
+  }
+}
+
+/**
+ * Sanitise email/label string to a safe filesystem name.
+ */
+function sanitizeLabel(label) {
+  return label.replace(/[^a-z0-9._-]/gi, '_').slice(0, 64);
+}
+
+/**
+ * Create a prismarine-auth Authflow for an account.
+ * The agent routes all Microsoft / Xbox Live HTTPS auth calls
+ * through the proxy, so each account can have a unique IP.
+ *
+ * Cache is stored per-account in /tmp so tokens survive
+ * process restarts within the same Railway container.
+ */
+function createAuthflow(email, proxyUrl, onMsaCode) {
+  const cacheDir = path.join(os.tmpdir(), 'donut-auth-cache', sanitizeLabel(email));
+  const agent    = buildAgent(proxyUrl);
+
+  const opts = {
+    flow: 'live',
+    ...(agent ? { agent } : {}),
+  };
+
+  return new Authflow(email, cacheDir, opts, onMsaCode);
+}
+
+// ─────────────────────────────────────────────
+//  Discord init
+// ─────────────────────────────────────────────
 async function initDiscord() {
   discord = new DiscordClient({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-    ],
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
   });
 
   discord.once('ready', async () => {
     console.log(`🤖 Discord bot ready: ${discord.user.tag}`);
     discord.user.setActivity('donutsmp.net', { type: ActivityType.Watching });
-
     try {
       discordChannel = await discord.channels.fetch(DISCORD_CHANNEL_ID);
       discordChannel.send({
         embeds: [makeEmbed('🟢 Bot Manager Online', 'DonutSMP bot dashboard is running.', 0x00ff87)],
       }).catch(() => {});
     } catch (_) {
-      console.warn('⚠️  Could not fetch Discord channel — check channelId in config.json');
+      console.warn('⚠️  Could not fetch Discord channel — check DISCORD_CHANNEL_ID env var');
     }
   });
 
-  // ── Slash command handler ──────────────────
   discord.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     const { commandName } = interaction;
@@ -78,24 +156,21 @@ async function initDiscord() {
 
     if (commandName === 'connect') {
       const email = interaction.options.getString('account');
+      const proxy = interaction.options.getString('proxy') ?? null;
       const existing = accountData.get(email);
       if (existing && ['Connecting', 'Online', 'Auth Required'].includes(existing.status)) {
         return interaction.editReply({ embeds: [makeEmbed('⚠️ Already Active', `\`${email}\` is already ${existing.status}.`, 0xffb830)] });
       }
-      startBot(email, false);
-      return interaction.editReply({ embeds: [makeEmbed('🚀 Connecting', `Starting connection for \`${email}\`...`, 0x00c6ff)] });
+      startBot(email, false, proxy);
+      const proxyNote = proxy ? `\n🔀 Proxy: \`${maskProxy(proxy)}\`` : '';
+      return interaction.editReply({ embeds: [makeEmbed('🚀 Connecting', `Starting connection for \`${email}\`...${proxyNote}`, 0x00c6ff)] });
     }
 
     if (commandName === 'disconnect') {
       const email = interaction.options.getString('account');
       const bot = accountData.get(email);
       if (!bot) return interaction.editReply({ embeds: [makeEmbed('❌ Not Found', `No session for \`${email}\`.`, 0xff4560)] });
-      bot.manualDisconnect = true;
-      bot.disconnectHandled = true;
-      bot.autoReconnect = false;
-      clearTimeout(bot.reconnectTimer);
-      if (bot.client) { try { bot.client.disconnect(); } catch (_) {} bot.client = null; }
-      bot.status = 'Offline';
+      disconnectBot(email);
       addLog(email, '🔌 Disconnected via Discord.');
       broadcastUpdate(email);
       return interaction.editReply({ embeds: [makeEmbed('🔌 Disconnected', `\`${email}\` has been disconnected.`, 0xff4560)] });
@@ -124,7 +199,8 @@ async function initDiscord() {
       const lines = [];
       for (const [email, d] of accountData.entries()) {
         const icon = { Online:'🟢', Connecting:'🟡', 'Auth Required':'🔵', Error:'🔴', Offline:'⚫' }[d.status] ?? '⚫';
-        lines.push(`${icon} **${email}** — ${d.status} (reconnects: ${d.reconnectAttempts})`);
+        const px = d.proxy ? ` | 🔀 ${maskProxy(d.proxy)}` : '';
+        lines.push(`${icon} **${email}** — ${d.status} (RC: ${d.reconnectAttempts})${px}`);
       }
       return interaction.editReply({ embeds: [makeEmbed('📊 Session Status', lines.join('\n'), 0x5865f2)] });
     }
@@ -180,10 +256,10 @@ app.get('/events', (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.flushHeaders();
-  const heartbeat = setInterval(() => res.write(': ping\n\n'), 15000);
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  const hb   = setInterval(() => res.write(': ping\n\n'), 15000);
+  const send = (d) => res.write(`data: ${JSON.stringify(d)}\n\n`);
   globalEmitter.on('update', send);
-  req.on('close', () => { clearInterval(heartbeat); globalEmitter.off('update', send); });
+  req.on('close', () => { clearInterval(hb); globalEmitter.off('update', send); });
 });
 
 // ─────────────────────────────────────────────
@@ -193,10 +269,12 @@ app.get('/status', (req, res) => {
   const out = {};
   for (const [email, d] of accountData.entries()) {
     out[email] = {
-      status: d.status, logs: d.logs.slice(-80),
+      status: d.status,
+      logs: d.logs.slice(-80),
       autoReconnect: d.autoReconnect,
       reconnectAttempts: d.reconnectAttempts,
       deviceCode: d.deviceCode,
+      proxy: maskProxy(d.proxy),
     };
   }
   res.json(out);
@@ -214,16 +292,31 @@ app.get('/discord-status', (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-//  POST /connect
+//  GET /proxies  — send available proxy presets to the UI
+// ─────────────────────────────────────────────
+app.get('/proxies', (req, res) => {
+  // Never send the actual URL (contains credentials) — just labels + identifiers
+  res.json(PROXY_LIST.map(p => ({ label: p.label, host: p.host, port: p.port, ip: p.ip })));
+});
+
+// ─────────────────────────────────────────────
+//  POST /connect  — now accepts optional proxy
 // ─────────────────────────────────────────────
 app.post('/connect', (req, res) => {
-  const { email } = req.body;
+  const { email, proxy = null, proxyIndex = null } = req.body;
   if (!email) return res.status(400).json({ error: 'email required' });
   const existing = accountData.get(email);
   if (existing && ['Connecting', 'Online', 'Auth Required'].includes(existing.status)) {
     return res.status(400).json({ error: 'Already connecting or connected' });
   }
-  startBot(email, false);
+
+  // Resolve proxy: preset index takes priority over raw URL
+  let resolvedProxy = proxy;
+  if (proxyIndex !== null && proxyIndex >= 0 && PROXY_LIST[proxyIndex]) {
+    resolvedProxy = PROXY_LIST[proxyIndex].url;
+  }
+
+  startBot(email, false, resolvedProxy);
   res.json({ success: true });
 });
 
@@ -234,13 +327,7 @@ app.post('/disconnect', (req, res) => {
   const { email } = req.body;
   const bot = accountData.get(email);
   if (!bot) return res.status(400).json({ error: 'Session not found' });
-  bot.manualDisconnect = true;
-  bot.disconnectHandled = true;
-  bot.autoReconnect = false;
-  clearTimeout(bot.reconnectTimer);
-  bot.reconnectTimer = null;
-  if (bot.client) { try { bot.client.disconnect(); } catch (_) {} bot.client = null; }
-  bot.status = 'Offline';
+  disconnectBot(email);
   addLog(email, '🔌 Manually disconnected.');
   broadcastUpdate(email);
   res.json({ success: true });
@@ -263,6 +350,28 @@ app.get('/chat', (req, res) => {
   } else {
     res.status(400).send('Bot offline');
   }
+});
+
+// ─────────────────────────────────────────────
+//  POST /set-proxy  — update proxy for a session
+//  (takes effect on next connection)
+// ─────────────────────────────────────────────
+app.post('/set-proxy', (req, res) => {
+  const { email, proxy, proxyIndex = null } = req.body;
+  const bot = accountData.get(email);
+  if (!bot) return res.status(400).json({ error: 'Session not found' });
+
+  let resolvedProxy = proxy || null;
+  if (proxyIndex !== null && proxyIndex >= 0 && PROXY_LIST[proxyIndex]) {
+    resolvedProxy = PROXY_LIST[proxyIndex].url;
+  }
+
+  bot.proxy = resolvedProxy;
+  addLog(email, resolvedProxy
+    ? `🔀 Proxy updated: ${maskProxy(resolvedProxy)}`
+    : '🔀 Proxy cleared — next connect will be direct');
+  broadcastUpdate(email);
+  res.json({ proxy: maskProxy(bot.proxy) });
 });
 
 // ─────────────────────────────────────────────
@@ -308,6 +417,24 @@ app.post('/set-reconnect', (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+//  Shared disconnect logic
+// ─────────────────────────────────────────────
+function disconnectBot(email) {
+  const bot = accountData.get(email);
+  if (!bot) return;
+  bot.manualDisconnect  = true;
+  bot.disconnectHandled = true;
+  bot.autoReconnect     = false;
+  clearTimeout(bot.reconnectTimer);
+  bot.reconnectTimer = null;
+  if (bot.client) {
+    try { bot.client.disconnect(); } catch (_) {}
+    bot.client = null;
+  }
+  bot.status = 'Offline';
+}
+
+// ─────────────────────────────────────────────
 //  Internal helpers
 // ─────────────────────────────────────────────
 function addLog(email, message) {
@@ -323,10 +450,12 @@ function broadcastUpdate(email) {
   if (!bot) return;
   globalEmitter.emit('update', {
     type: 'update', email,
-    status: bot.status, logs: bot.logs.slice(-30),
+    status: bot.status,
+    logs: bot.logs.slice(-30),
     autoReconnect: bot.autoReconnect,
     reconnectAttempts: bot.reconnectAttempts,
     deviceCode: bot.deviceCode,
+    proxy: maskProxy(bot.proxy),
   });
   discordUpdateActivity();
 }
@@ -358,59 +487,87 @@ function handleSessionEnd(email, reason, isError = false) {
 // ─────────────────────────────────────────────
 //  startBot
 // ─────────────────────────────────────────────
-function startBot(email, isReconnect = false) {
+function startBot(email, isReconnect = false, proxyUrl = null) {
   if (!accountData.has(email)) {
     accountData.set(email, {
       client: null, status: 'Connecting', logs: [],
       autoReconnect: true, reconnectAttempts: 0,
       manualDisconnect: false, deviceCode: null,
       reconnectTimer: null, disconnectHandled: false,
+      proxy: proxyUrl,
     });
   }
 
   const bot = accountData.get(email);
-  bot.status = 'Connecting';
-  bot.deviceCode = null;
+
+  // A proxy supplied at connect-time locks it in for all future reconnects
+  if (!isReconnect && proxyUrl !== null) bot.proxy = proxyUrl;
+
+  bot.status           = 'Connecting';
+  bot.deviceCode       = null;
   bot.manualDisconnect = false;
   bot.disconnectHandled = false;
 
+  const maskedProxy = maskProxy(bot.proxy);
+
   if (isReconnect) {
     bot.reconnectAttempts += 1;
-    addLog(email, `🔄 Reconnect attempt #${bot.reconnectAttempts} — connecting to donutsmp.net...`);
+    addLog(email, `🔄 Reconnect attempt #${bot.reconnectAttempts}${maskedProxy ? ` via ${maskedProxy}` : ''}`);
   } else {
     bot.reconnectAttempts = 0;
-    addLog(email, '🚀 Starting connection to donutsmp.net:19132...');
-    discordNotify('🚀 Connecting', `\`${email}\` is connecting to donutsmp.net...`, 0x00c6ff);
+    addLog(email, `🚀 Connecting to donutsmp.net${maskedProxy ? ` via ${maskedProxy}` : ' (direct)'}...`);
+    discordNotify(
+      '🚀 Connecting',
+      `\`${email}\` → donutsmp.net${maskedProxy ? `\n🔀 Proxy: \`${maskedProxy}\`` : ''}`,
+      0x00c6ff
+    );
   }
 
   broadcastUpdate(email);
 
+  // ── Build onMsaCode handler ─────────────────
+  function onMsaCode(data) {
+    bot.deviceCode = {
+      userCode:        data.user_code,
+      verificationUri: data.verification_uri,
+      expiresIn:       data.expires_in,
+    };
+    bot.status = 'Auth Required';
+    addLog(email, `🔑 Microsoft auth required!`);
+    addLog(email, `   -> Visit: ${data.verification_uri}`);
+    addLog(email, `   -> Code:  ${data.user_code}  (expires in ${Math.round(data.expires_in / 60)} min)`);
+    broadcastUpdate(email);
+    discordNotify(
+      '🔑 Microsoft Auth Required',
+      `**Account:** \`${email}\`\n**Code:** \`${data.user_code}\`\n**URL:** ${data.verification_uri}\n**Expires in:** ${Math.round(data.expires_in / 60)} min`,
+      0x00c6ff
+    );
+  }
+
+  // ── Create Authflow with proxy agent ────────
+  // prismarine-auth routes all Microsoft / Xbox Live HTTPS calls
+  // through the agent, giving each account its own IP for auth.
+  let authflow;
+  try {
+    authflow = createAuthflow(email, bot.proxy, onMsaCode);
+  } catch (err) {
+    bot.status = 'Error';
+    addLog(email, `❌ Authflow creation failed: ${err.message}`);
+    broadcastUpdate(email);
+    scheduleReconnect(email);
+    return;
+  }
+
+  // ── Create bedrock client using the custom authflow ──
   let client;
   try {
     client = createClient({
-      host: 'donutsmp.net',
-      port: 19132,
+      host:     'donutsmp.net',
+      port:     19132,
       username: email.includes('@') ? email.split('@')[0] : email,
-      offline: false,
-      onMsaCode(data) {
-        bot.deviceCode = {
-          userCode: data.user_code,
-          verificationUri: data.verification_uri,
-          expiresIn: data.expires_in,
-        };
-        bot.status = 'Auth Required';
-        addLog(email, `🔑 Microsoft auth required!`);
-        addLog(email, `   -> Visit: ${data.verification_uri}`);
-        addLog(email, `   -> Code:  ${data.user_code}  (expires in ${Math.round(data.expires_in / 60)} min)`);
-        broadcastUpdate(email);
-
-        // Send auth code to Discord so you can auth from your phone
-        discordNotify(
-          '🔑 Microsoft Auth Required',
-          `**Account:** \`${email}\`\n**Code:** \`${data.user_code}\`\n**URL:** ${data.verification_uri}\n**Expires in:** ${Math.round(data.expires_in / 60)} minutes`,
-          0x00c6ff
-        );
-      },
+      offline:  false,
+      authflow,          // prismarine-auth Authflow with proxy agent
+      // onMsaCode is now handled inside the Authflow constructor
     });
   } catch (err) {
     bot.status = 'Error';
@@ -423,9 +580,9 @@ function startBot(email, isReconnect = false) {
   bot.client = client;
 
   client.on('spawn', () => {
-    bot.status = 'Online';
+    bot.status           = 'Online';
     bot.reconnectAttempts = 0;
-    bot.deviceCode = null;
+    bot.deviceCode       = null;
     bot.disconnectHandled = false;
     addLog(email, '✅ Spawned! Connected to donutsmp.net.');
     broadcastUpdate(email);
@@ -443,11 +600,8 @@ function startBot(email, isReconnect = false) {
     }
   });
 
-  client.on('join', () => {
-    addLog(email, '📶 Joined server — waiting for spawn...');
-  });
+  client.on('join', () => addLog(email, '📶 Joined server — waiting for spawn...'));
 
-  // Mirror in-game chat to the Discord channel
   client.on('text', (packet) => {
     const msg = packet.message || packet.parameters?.join(' ');
     if (!msg) return;
@@ -459,39 +613,34 @@ function startBot(email, isReconnect = false) {
 
   // PRIMARY: packet 0x05
   client.on('disconnect', (packet) => {
-    const reason = packet?.message
+    handleSessionEnd(email, packet?.message
       ? `Disconnected by server — ${packet.message}`
-      : 'Disconnected by server (packet 0x05)';
-    handleSessionEnd(email, reason);
+      : 'Disconnected by server (packet 0x05)');
   });
 
   // FALLBACK 1: clean TCP close
-  client.on('end', () => {
-    handleSessionEnd(email, 'Connection ended (socket closed by server)');
-  });
+  client.on('end', () => handleSessionEnd(email, 'Connection ended (socket closed)'));
 
-  // FALLBACK 2: abrupt socket close
-  client.on('close', (hadError) => {
-    handleSessionEnd(email, hadError ? 'Connection lost (socket error)' : 'Connection closed', hadError);
-  });
+  // FALLBACK 2: abrupt close
+  client.on('close', (hadError) => handleSessionEnd(
+    email,
+    hadError ? 'Connection lost (socket error)' : 'Connection closed',
+    hadError
+  ));
 
-  // FALLBACK 3: errors
-  client.on('error', (err) => {
-    handleSessionEnd(email, `Error — ${err.message}`, true);
-  });
+  // FALLBACK 3: error
+  client.on('error', (err) => handleSessionEnd(email, `Error — ${err.message}`, true));
 }
 
 // ─────────────────────────────────────────────
-//  Reconnect scheduler
+//  Reconnect scheduler (exponential back-off)
 // ─────────────────────────────────────────────
 function scheduleReconnect(email) {
   const bot = accountData.get(email);
   if (!bot || bot.manualDisconnect || !bot.autoReconnect) return;
 
   const delay = Math.min(5000 * Math.pow(1.5, Math.min(bot.reconnectAttempts, 12)), 60000);
-  const secs  = (delay / 1000).toFixed(1);
-
-  addLog(email, `⏱️  Auto-reconnect in ${secs}s (attempt ${bot.reconnectAttempts + 1})`);
+  addLog(email, `⏱️  Auto-reconnect in ${(delay / 1000).toFixed(1)}s (attempt ${bot.reconnectAttempts + 1})`);
   broadcastUpdate(email);
 
   clearTimeout(bot.reconnectTimer);
@@ -501,14 +650,13 @@ function scheduleReconnect(email) {
 }
 
 // ─────────────────────────────────────────────
-//  Start — Express binds first so Railway health
-//  checks pass, then Discord initialises async
+//  Start
 // ─────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n  🍩  DonutSMP Bot GUI  ->  http://0.0.0.0:${PORT}`);
-  console.log(`  🤖  Discord bot: ${DISCORD_ENABLED ? 'ENABLED' : 'DISABLED (set DISCORD_TOKEN env var)'}\n`);
+  console.log(`  🤖  Discord: ${DISCORD_ENABLED ? 'ENABLED' : 'DISABLED (set DISCORD_TOKEN)'}`);
+  console.log(`  🔀  Proxy support: prismarine-auth (https-proxy-agent + socks-proxy-agent)\n`);
 
-  // Start Discord AFTER Express is bound so a Discord crash can't block the port
   if (DISCORD_ENABLED) {
     initDiscord().catch(err => console.error('Discord init failed:', err.message));
   }
