@@ -104,6 +104,27 @@
       border-radius: 3px;
     }
 
+    .header-right-group {
+      display: flex; align-items: center; gap: 14px;
+    }
+
+    .discord-pill {
+      display: flex; align-items: center; gap: 7px;
+      padding: 4px 12px; border-radius: 20px;
+      font-size: 11px; font-weight: 700; letter-spacing: .5px;
+      border: 1px solid transparent;
+      transition: all .3s;
+    }
+    .discord-dot {
+      width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+    }
+    .discord-unknown  { color: var(--text-muted); border-color: var(--border); }
+    .discord-unknown .discord-dot { background: var(--text-muted); }
+    .discord-online   { color: #7289da; border-color: rgba(114,137,218,.4); background: rgba(114,137,218,.08); }
+    .discord-online .discord-dot  { background: #7289da; box-shadow: 0 0 6px #7289da; animation: pulse 2s infinite; }
+    .discord-offline  { color: var(--red); border-color: rgba(255,69,96,.3); }
+    .discord-offline .discord-dot { background: var(--red); }
+
     .version-tag {
       font-size: 11px;
       color: var(--text-dim);
@@ -113,8 +134,14 @@
     /* ── Connect Bar ── */
     .connect-bar {
       display: flex;
-      gap: 10px;
+      flex-direction: column;
+      gap: 8px;
       margin-bottom: 24px;
+    }
+
+    .connect-row {
+      display: flex;
+      gap: 10px;
       align-items: center;
     }
 
@@ -135,6 +162,20 @@
       box-shadow: 0 0 0 2px var(--green-dim);
     }
     .connect-bar input::placeholder { color: var(--text-muted); }
+
+    .proxy-input { border-color: rgba(114,137,218,.3) !important; }
+    .proxy-input:focus { border-color: #7289da !important; box-shadow: 0 0 0 2px rgba(114,137,218,.15) !important; }
+
+    .proxy-badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: 10px; font-weight: 700; letter-spacing: .5px;
+      padding: 2px 8px; border-radius: 3px;
+      color: #7289da;
+      background: rgba(114,137,218,.1);
+      border: 1px solid rgba(114,137,218,.25);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      max-width: 220px;
+    }
 
     /* ── Buttons ── */
     .btn {
@@ -442,20 +483,37 @@
       <div class="logo">DONUT<span>BOT</span></div>
       <div class="server-tag">donutsmp.net</div>
     </div>
-    <div class="version-tag">bedrock-protocol · MS OAuth · v1.0</div>
+    <div class="header-right-group">
+      <div id="discordStatus" class="discord-pill discord-unknown">
+        <span class="discord-dot"></span>
+        <span class="discord-label">Discord</span>
+      </div>
+      <div class="version-tag">bedrock-protocol · MS OAuth · v1.0</div>
+    </div>
   </div>
 
   <!-- Connect bar -->
   <div class="connect-bar">
-    <input
-      id="emailInput"
-      type="text"
-      placeholder="Enter account label (e.g. alt@outlook.com or just 'Alt1')"
-      autocomplete="off"
-    />
-    <button class="btn btn-green" onclick="handleConnect()">
-      <span>⚡</span> Connect
-    </button>
+    <div class="connect-row">
+      <input
+        id="emailInput"
+        type="text"
+        placeholder="Account label (e.g. alt@outlook.com or 'Alt1')"
+        autocomplete="off"
+      />
+      <button class="btn btn-green" onclick="handleConnect()">
+        <span>⚡</span> Connect
+      </button>
+    </div>
+    <div class="connect-row">
+      <select
+        id="proxySelect"
+        class="proxy-input"
+        style="flex:1;background:var(--surface);border:1px solid rgba(114,137,218,.3);color:var(--text);font-family:inherit;font-size:13px;padding:10px 14px;border-radius:5px;outline:none;cursor:pointer;"
+      >
+        <option value="">🔀 Proxy — Direct (no proxy)</option>
+      </select>
+    </div>
   </div>
 
   <!-- Sessions list -->
@@ -506,10 +564,36 @@
   });
 
   // ─────────────────────────────────────────────
+  //  Load proxy presets into the dropdown
+  // ─────────────────────────────────────────────
+  async function loadProxies() {
+    try {
+      const res  = await fetch('/proxies');
+      const list = await res.json();
+      const sel  = document.getElementById('proxySelect');
+      list.forEach((p, i) => {
+        const opt = document.createElement('option');
+        opt.value = i;
+        opt.textContent = `🔀 ${p.label}  (${p.ip}:${p.port})`;
+        sel.appendChild(opt);
+      });
+      if (list.length === 0) {
+        const opt = document.createElement('option');
+        opt.disabled = true;
+        opt.textContent = 'No proxy presets — set PROXY_USERNAME + PROXY_PASSWORD env vars';
+        sel.appendChild(opt);
+      }
+    } catch (_) {}
+  }
+  loadProxies();
+
+  // ─────────────────────────────────────────────
   //  Connect
   // ─────────────────────────────────────────────
   async function handleConnect() {
     const email = document.getElementById('emailInput').value.trim();
+    const sel   = document.getElementById('proxySelect');
+    const proxyIndex = sel.value !== '' ? parseInt(sel.value) : null;
     if (!email) { toast('Enter an account label first.', 'warn'); return; }
 
     const s = sessions[email];
@@ -517,16 +601,60 @@
       toast(`${email} is already active.`, 'warn'); return;
     }
 
-    sessions[email] = { status: 'Connecting', logs: [], autoReconnect: true, reconnectAttempts: 0, deviceCode: null };
+    const proxyLabel = proxyIndex !== null ? sel.options[sel.selectedIndex].textContent : null;
+    sessions[email] = { status: 'Connecting', logs: [], autoReconnect: true, reconnectAttempts: 0, deviceCode: null, proxy: proxyLabel };
     ensureCard(email);
     renderSession(email);
     updateEmptyState();
 
     try {
-      const res = await fetch('/connect', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ email }) });
+      const res = await fetch('/connect', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ email, proxyIndex })
+      });
       if (!res.ok) { const t = await res.text(); toast(t, 'error'); }
-      else toast(`Connecting ${email}...`);
+      else toast(`Connecting ${email}${proxyIndex !== null ? ' via ' + sel.options[sel.selectedIndex].textContent : ''}...`);
     } catch (e) { toast('Server error: ' + e.message, 'error'); }
+  }
+
+  // ─────────────────────────────────────────────
+  //  Populate a per-card proxy dropdown with presets
+  // ─────────────────────────────────────────────
+  async function populateCardProxySelect(email) {
+    const eId = CSS.escape(email);
+    const sel = document.getElementById(`proxy-edit-${eId}`);
+    if (!sel || sel.options.length > 1) return; // already populated
+    try {
+      const res  = await fetch('/proxies');
+      const list = await res.json();
+      list.forEach((p, i) => {
+        const opt = document.createElement('option');
+        opt.value = i;
+        opt.textContent = `${p.label}  (${p.ip}:${p.port})`;
+        sel.appendChild(opt);
+      });
+    } catch (_) {}
+  }
+
+  // ─────────────────────────────────────────────
+  //  Set / update proxy on an existing session
+  // ─────────────────────────────────────────────
+  async function handleSetProxy(email) {
+    const eId = CSS.escape(email);
+    const sel = document.getElementById(`proxy-edit-${eId}`);
+    if (!sel) return;
+    const proxyIndex = sel.value !== '' ? parseInt(sel.value) : null;
+    try {
+      await fetch('/set-proxy', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ email, proxyIndex })
+      });
+      const label = proxyIndex !== null ? sel.options[sel.selectedIndex].textContent : null;
+      if (sessions[email]) sessions[email].proxy = label;
+      toast(proxyIndex !== null ? `Proxy updated for ${email}` : `Proxy cleared for ${email}`);
+    } catch (e) { toast('Error: ' + e.message, 'error'); }
   }
 
   // ─────────────────────────────────────────────
@@ -697,6 +825,21 @@
         <button class="btn btn-ghost" onclick="clearLogs('${escJs(email)}')">🗑 Clear Logs</button>
       </div>
 
+      <!-- Proxy editor -->
+      <div class="connect-row" style="margin-bottom:10px;gap:8px;">
+        <select
+          id="proxy-edit-${eId}"
+          class="proxy-input"
+          style="flex:1;background:var(--surface);border:1px solid rgba(114,137,218,.3);color:var(--text);font-family:inherit;font-size:12px;padding:8px 12px;border-radius:5px;outline:none;cursor:pointer;"
+        >
+          <option value="">Direct (no proxy)</option>
+        </select>
+        <button class="btn btn-ghost" style="border-color:rgba(114,137,218,.4);color:#7289da;white-space:nowrap;" onclick="handleSetProxy('${escJs(email)}')">
+          Set Proxy
+        </button>
+      </div>
+      ${s.proxy ? `<div style="margin-bottom:8px;"><span class="proxy-badge">🔀 ${escHtml(s.proxy)}</span></div>` : ''}
+
       <!-- Chat -->
       <div class="chat-row">
         <input
@@ -723,10 +866,8 @@
     `;
 
     renderLogs(email);
+    populateCardProxySelect(email);
   }
-
-  // ─────────────────────────────────────────────
-  //  Patch (update log + stats without full re-render)
   // ─────────────────────────────────────────────
   function patchSession(email) {
     const s = sessions[email];
@@ -856,6 +997,34 @@
     c.appendChild(t);
     setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity .4s'; setTimeout(() => t.remove(), 400); }, 4000);
   }
+
+  // ─────────────────────────────────────────────
+  //  Discord status pill
+  // ─────────────────────────────────────────────
+  async function pollDiscordStatus() {
+    try {
+      const res  = await fetch('/discord-status');
+      const data = await res.json();
+      const pill  = document.getElementById('discordStatus');
+      const label = pill.querySelector('.discord-label');
+
+      pill.className = 'discord-pill';
+
+      if (!data.enabled) {
+        pill.classList.add('discord-unknown');
+        label.textContent = 'Discord (disabled)';
+      } else if (data.connected) {
+        pill.classList.add('discord-online');
+        label.textContent = data.tag ? `Discord: ${data.tag}` : 'Discord: Online';
+      } else {
+        pill.classList.add('discord-offline');
+        label.textContent = 'Discord: Offline';
+      }
+    } catch (_) {}
+  }
+
+  pollDiscordStatus();
+  setInterval(pollDiscordStatus, 10000);
 
   // Enter key on email input
   document.getElementById('emailInput').addEventListener('keydown', e => {
