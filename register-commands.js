@@ -14,9 +14,7 @@ const commands = [
     .setName('connect')
     .setDescription('Connect a Minecraft bot account to donutsmp.net')
     .addStringOption(o =>
-      o.setName('account').setDescription('Account label (e.g. alt@outlook.com)').setRequired(true))
-    .addStringOption(o =>
-      o.setName('proxy').setDescription('Proxy URL (optional) — socks5://user:pass@host:port or http://host:port').setRequired(false)),
+      o.setName('account').setDescription('Account label (e.g. alt@outlook.com)').setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('disconnect')
